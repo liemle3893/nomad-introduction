@@ -1,0 +1,115 @@
+# frozen_string_literal: true
+
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+nomad_version = '0.10.5'
+
+nomad_unit = <<~SHELL
+  [Service]
+  ExecStart=/usr/bin/nomad agent -config /etc/nomad
+  [Install]
+  WantedBy=multi-user.target
+SHELL
+
+nomad_server_config = <<~HCL
+  server {
+    enabled = true
+    bootstrap_expect = 1
+  }
+HCL
+
+nomad_client_config = <<~HCL
+  client {
+    enabled = true
+    network_interface = "#{$interface_name}"
+    servers = ["192.168.59.101"]
+    options = {
+      driver.raw_exec.enable = "1"
+    }
+  }
+HCL
+
+nomad = <<~SHELL
+  if [ -a /usr/bin/nomad ]; then
+    echo nomad is already installed
+  else
+    apt-get install -y unzip
+    cd /tmp
+    curl https://releases.hashicorp.com/nomad/#{nomad_version}/nomad_#{nomad_version}_linux_amd64.zip > nomad.zip
+    unzip -d . nomad.zip
+    chmod +x nomad
+    mv nomad /usr/bin/nomad
+    rm nomad.zip
+    useradd -d /var/lib/nomad nomad
+    usermod -a -G nomad vagrant
+    mkhomedir_helper nomad
+    chmod g+rw /var/lib/nomad
+    mkdir -p /etc/nomad
+    mkdir -p /usr/lib/systemd/system
+    echo '#{nomad_unit}' > /usr/lib/systemd/system/nomad.service
+    systemctl daemon-reload
+    systemctl unmask nomad
+    systemctl enable nomad
+    sudo -u vagrant echo "export NOMAD_ADDR=http://192.168.59.101:4646" >> /home/vagrant/.bash_profile
+  fi
+SHELL
+
+docker = <<~SHELL
+  count=$(apt list --installed | grep docker | wc -l)
+  if [ $count == 0 ]; then
+    mkdir -p /etc/docker
+    sudo apt update
+    sudo apt-get remove docker docker-engine docker.io containerd runc
+    sudo apt install -y apt-transport-https ca-certificates curl software-properties-common
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+    sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu bionic stable"
+    sudo apt update
+    sudo apt install -y docker-ce
+    systemctl enable docker
+    systemctl start docker
+  else
+    echo docker is already installed
+  fi
+SHELL
+
+$interface_name = 'enp0s8'
+
+VAGRANTFILE_API_VERSION = '2'
+
+Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
+  config.vm.box = 'ubuntu/bionic64'
+  # Hardening box version
+  config.vm.box_version = '20200325.0.0'
+  config.ssh.insert_key = true
+  (1..2).each do |i|
+    config.vm.define "nomad#{i}" do |nomad_cfg|
+      nomad_cfg.vm.provision 'shell', inline: nomad
+      nomad_cfg.vm.provision 'shell', inline: docker
+      nomad_cfg.vm.provision 'shell', inline: 'sudo sysctl -w vm.max_map_count=262144'
+      ip = "192.168.59.#{100 + i}"
+      nomad_cfg.vm.hostname = "nomad#{i}"
+      nomad_cfg.vm.network :private_network, ip: ip.to_s
+      nomad_cfg.vm.provider "virtualbox" do |vb|
+        vb.memory = "1024"
+      end
+
+      nomad_config = <<-HCL
+        bind_addr = "#{ip}"
+        data_dir = "/var/lib/nomad"      
+      HCL
+
+      nomad_cfg.vm.provision 'shell', name: 'nomad config', inline: "echo '#{nomad_config}' > /etc/nomad/config.hcl"
+      if i == 1
+        nomad_cfg.vm.provision 'shell', name: 'nomad config', inline: "echo '#{nomad_server_config}' > /etc/nomad/server.hcl"
+      else
+        nomad_cfg.vm.provision 'shell', name: 'nomad config', inline: "echo '#{nomad_client_config}' > /etc/nomad/client.hcl"
+      end
+
+      nomad_cfg.vm.provision 'shell', name: 'restart docker', inline: 'systemctl restart docker'
+      nomad_cfg.vm.provision 'shell', name: 'Start nomad', inline: 'systemctl start nomad'
+    end
+  end
+
+  config.vm.provision :shell, inline: "sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config && systemctl reload sshd"
+end
