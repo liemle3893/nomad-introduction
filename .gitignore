@@ -1,6 +1,6 @@
 *.log
 *.retry
-/.vagrant/
+**/.vagrant/
 /golang/
 /istio-1.0.0/
 /istio-1.0.2/
